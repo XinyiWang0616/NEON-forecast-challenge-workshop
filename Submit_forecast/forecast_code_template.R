@@ -36,13 +36,15 @@ focal_sites <- aquatic_sites |>
 # Filter the targets
 targets <- targets %>%
   filter(site_id %in% focal_sites,
-         variable == 'temperature')
+         variable == c('temperature', 'oxygen'))
 #--------------------------#
 
 
 
 # ------ Weather data ------
-met_variables <- c("air_temperature")
+met_variables <- c("air_temperature", 
+                   "eastward_wind",
+                   "surface_downwelling_shortwave_flux_in_air")
 
 # Past stacked weather -----
 weather_past_s3 <- neon4cast::noaa_stage3()
@@ -105,27 +107,50 @@ for(i in 1:length(focal_sites)) {
   curr_site <- focal_sites[i]
   
   site_target <- targets_lm |>
-    filter(site_id == curr_site)
+    filter(site_id == curr_site) |>
+    arrange(datetime) |>
+    mutate(
+      air_temperature_lag = lag(air_temperature, 1),
+      shortwave_lag = lag(surface_downwelling_shortwave_flux_in_air, 1))
   
   noaa_future_site <- weather_future_daily |> 
-    filter(site_id == curr_site)
+    filter(site_id == curr_site) |>
+    arrange(datetime) |>
+    mutate(
+      air_temperature_lag = lag(air_temperature, 1),
+      shortwave_lag = lag(surface_downwelling_shortwave_flux_in_air, 1)
+    )
   
   #Fit linear model based on past data: water temperature = m * air temperature + b
   #you will need to change the variable on the left side of the ~ if you are forecasting oxygen or chla
-  fit <- lm(site_target$temperature ~ site_target$air_temperature)
-  # fit <- lm(site_target$temperature ~ ....)
+  # fit <- lm(site_target$temperature ~ site_target$air_temperature)
+  fit <- lm(oxygen ~ air_temperature +
+              I(air_temperature^2) +
+              eastward_wind +
+              surface_downwelling_shortwave_flux_in_air +
+              air_temperature_lag +
+              shortwave_lag, data=site_target
+  )
   
   # use linear regression to forecast water temperature for each ensemble member
   # You will need to modify this line of code if you add additional weather variables or change the form of the model
   # The model here needs to match the model used in the lm function above (or what model you used in the fit)
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+  # forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
   
+  # forecasted_oxygen <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature +
+  #   fit$coefficients[3] * I(noaa_future_site$air_temperature^2) + 
+  #   fit$coefficients[4] * noaa_future_site$eastward_wind + 
+  #   fit$coefficients[5] * noaa_future_site$surface_downwelling_shortwave_flux_in_air 
+  # fit$coefficients[6] * noaa_future_site$air_temperature_lag + 
+  # fit$coefficients[7] * noaa_future_site$shortwave_lag
+  
+  forecasted_oxygen <- predict(fit, newdata = noaa_future_site)
   # put all the relevant information into a tibble that we can bind together
   curr_site_df <- tibble(datetime = noaa_future_site$datetime,
                          site_id = curr_site,
                          parameter = noaa_future_site$parameter,
-                         prediction = forecasted_temperature,
-                         variable = "temperature") #Change this if you are forecasting a different variable
+                         prediction = forecasted_oxygen,
+                         variable = "oxygen") #Change this if you are forecasting a different variable
   
   forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
   message(curr_site, 'forecast run')
@@ -152,6 +177,7 @@ forecast_df_EFI <- forecast_df %>%
 
 
 
+
 # ----- Submit forecast -----
 # Write the forecast to file
 theme <- 'aquatics'
@@ -167,7 +193,7 @@ neon4cast::forecast_output_validator(forecast_file)
 neon4cast::submit(forecast_file =  forecast_file, ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
 
 #--------------------------#
-
+Sys.setlocale("LC_TIME", "English")
 forecast_df_EFI |> 
   ggplot(aes(x=datetime, y=prediction, group = parameter)) +
   geom_line() +
@@ -175,6 +201,6 @@ forecast_df_EFI |>
   labs(title = paste0('Forecast generated for ', forecast_df_EFI$variable[1], ' on ', forecast_df_EFI$reference_datetime[1]))
 
 plot_file_name <- paste0("Submit_forecast/", forecast_df_EFI$variable[1], '-', forecast_df_EFI$reference_datetime[1], ".png")
-ggsave(plot_file_name)
+ggsave(plot_file_name, width = 12, height = 8)
 
-
+# plot needs to be submitted to Canvas

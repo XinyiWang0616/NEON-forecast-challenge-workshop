@@ -37,6 +37,7 @@ To complete the workshop via this markdown document the following packages will 
 The following code chunk should be run to install packages.
 
 ```{r eval = F}
+Sys.setenv(LANGUAGE = "en")
 install.packages('remotes')
 install.packages('fpp3') # package for applying simple forecasting methods
 install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
@@ -49,8 +50,8 @@ Additionally, R version 4.2 is required to run the neon4cast package.
 It's also worth checking your Rtools is up to date and compatible with R 4.2, see (<https://cran.r-project.org/bin/windows/Rtools/rtools42/rtools.html>).
 
 ```{r}
+Sys.setenv(LANGUAGE = "en")
 version$version.string
-
 library(tidyverse)
 library(lubridate)
 ```
@@ -205,6 +206,8 @@ Note: This code chunk can take a few minutes to execute as it accesses the NOAA 
 
 ```{r, message=FALSE}
 # past stacked weather
+remotes::install_github("eco4cast/neon4cast")
+library(neon4cast)
 noaa_past_s3 <- neon4cast::noaa_stage3()
 
 variables <- c("air_temperature")
@@ -326,7 +329,7 @@ fit <- lm(site_target$temperature ~ site_target$air_temperature)
     
 # use linear regression to forecast water temperature for each ensemble member
 forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
-
+# coefficient_2 is the slope
 ```
 
 Next, we will can loop through this for each site to create a site-wise forecast of water temperature based on a linear model and each forecasted air temperature.
@@ -335,6 +338,7 @@ After we run this forecast for each site, we will bind them together to submit a
 ## Specify forecast model
 
 ```{r}
+# generate forecasts for every site
 temp_lm_forecast <- NULL
 
 for(i in 1:length(lake_sites$field_site_id)) {  
@@ -373,6 +377,7 @@ On this plot each line represents one of the possible forecasts and the range of
 Looking back at the forecasts we produced:
 
 ```{r, echo = F, warning = F}
+Sys.setlocale("LC_TIME", "English")
 temp_lm_forecast %>% 
   filter(variable == 'temperature') %>%
   ggplot(.,aes(x=datetime, y=prediction, group = parameter)) + 
@@ -464,7 +469,7 @@ neon4cast::forecast_output_validator(forecast_file_1)
 
 ```{r eval = FALSE}
 # can uses the neon4cast::forecast_output_validator() to check the forecast is in the right format
-neon4cast::submit(forecast_file = forecast_file_1),
+neon4cast::submit(forecast_file = forecast_file_1,
                   ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
 ```
 
@@ -486,7 +491,7 @@ ggplot(targets_lm, aes(x=air_temperature, y= temperature, colour = site_id)) +
 ## TASKS
 
 Possible modifications to Model 1 - simple linear model:
-
+# wind or air_temperature a few days after
 -   Include additional NOAA co-variates in the linear model (remember to 'collect' and subset the right data from NOAA)
 -   Specify a non-linear relationship
 -   Try forecasting another variable (oxygen or chlorophyll) - could you use your water temperature to estimate dissolved oxygen concentration at the surface?
@@ -895,6 +900,8 @@ neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_2),
 Possible modifications to the persistence RW model:
 
 -   How does the number of ensembles change the uncertainty?
+Answer: Increasing the number of ensembles would not change the forecast uncertainty, it mainly reduces sampling error, making estimated prediction intervals smoother and more stable.
+
 -   Are the transformations reasonable? Have a look [here](https://otexts.com/fpp3/ftransformations.html) about applying other types of transformations in Fable
 -   Do you expect there to be a long term trends in that is not captured? Try adding a `drift()` term to the model
 
