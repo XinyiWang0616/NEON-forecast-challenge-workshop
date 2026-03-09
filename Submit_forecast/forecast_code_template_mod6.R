@@ -1,0 +1,222 @@
+    ## install.packages('remotes')
+    ## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+    ## install.packages('lubridate') # working with dates and times
+    ## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+    
+    # ------ Load packages -----
+    library(tidyverse)
+    library(lubridate)
+    #--------------------------#
+    
+    # Change this for your model ID
+    # Include the word "example" in my_model_id for a test submission
+    # Don't include the word "example" in my_model_id for a forecast that you have registered (see neon4cast.org for the registration form)
+    my_model_id <- 'example_ID'
+    
+    # --Model description--- #
+    # Drivers include: air temperature, eastern wind, and solar radiation
+    # Target: Water temperature/oxygen
+    
+    # -- Uncertainty representation -- #
+    # Uncertainty description: Process uncertainty, Drivers uncertainty, and Parameter uncertainty are included in the forecasting.
+    #------- Read data --------
+    # read in the targets data
+    targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+    
+    # read in the sites data
+    aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-ci/refs/heads/main/neon4cast_field_site_metadata.csv") |>
+      dplyr::filter(aquatics == 1)
+    
+    focal_sites <- aquatic_sites |> 
+      filter(field_site_subtype == 'Lake') |> 
+      pull(field_site_id)
+    
+    # Filter the targets
+    targets <- targets %>%
+      filter(site_id %in% focal_sites,
+             variable == c('temperature', 'oxygen'))
+    #--------------------------#
+    
+    
+    
+    # ------ Weather data ------
+    met_variables <- c("air_temperature", 
+                       "eastward_wind",
+                       "surface_downwelling_shortwave_flux_in_air")
+    
+    # Past stacked weather -----
+    weather_past_s3 <- neon4cast::noaa_stage3()
+    
+    weather_past <- weather_past_s3  |> 
+      dplyr::filter(site_id %in% focal_sites,
+                    datetime >= ymd('2017-01-01'),
+                    variable %in% met_variables) |> 
+      dplyr::collect()
+    
+    # aggregate the past to mean values
+    weather_past_daily <- weather_past |> 
+      mutate(datetime = as_date(datetime)) |> 
+      group_by(datetime, site_id, variable) |> 
+      summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+      # convert air temperature to Celsius if it is included in the weather data
+      mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+      pivot_wider(names_from = variable, values_from = prediction)
+    
+    # Future weather forecast --------
+    # New forecast only available at 5am UTC the next day
+    forecast_date <- Sys.Date() 
+    noaa_date <- forecast_date - days(1)
+    
+    weather_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+    
+    weather_future <- weather_future_s3 |> 
+      dplyr::filter(datetime >= forecast_date,
+                    site_id %in% focal_sites,
+                    variable %in% met_variables) |> 
+      collect()
+    
+    weather_future_daily <- weather_future |> 
+      mutate(datetime = as_date(datetime)) |> 
+      # mean daily forecasts at each site per ensemble
+      group_by(datetime, site_id, parameter, variable) |> 
+      summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+      # convert air temperature to Celsius if it is included in the weather data
+      mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+      pivot_wider(names_from = variable, values_from = prediction) |> 
+      select(any_of(c('datetime', 'site_id', met_variables, 'parameter')))
+    
+    #--------------------------#
+    
+    
+    
+    # ----- Fit model & generate forecast----
+    
+    # Generate a dataframe to fit the model to 
+    targets_lm <- targets |> 
+      pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+      left_join(weather_past_daily, 
+                by = c("datetime","site_id"))
+    
+    # Loop through each site to fit the model
+    forecast_df <- NULL
+    
+    for(i in 1:length(focal_sites)) {  
+      
+      curr_site <- focal_sites[i]
+      
+      # historical observations: training
+      site_target <- targets_lm |>
+        filter(site_id == curr_site) |>
+        arrange(datetime) |>
+        mutate(
+          air_temperature_lag = lag(air_temperature, 1),
+          shortwave_lag = lag(surface_downwelling_shortwave_flux_in_air, 1))
+      
+      # future weather forecasting: predicting
+      noaa_future_site <- weather_future_daily |> 
+        filter(site_id == curr_site) |>
+        arrange(datetime) |>
+        mutate(
+          air_temperature_lag = lag(air_temperature, 1),
+          shortwave_lag = lag(surface_downwelling_shortwave_flux_in_air, 1))
+      
+      #Fit linear model based on past data: water temperature = m * air temperature + b
+      #you will need to change the variable on the left side of the ~ if you are forecasting oxygen or chla
+      # fit <- lm(site_target$temperature ~ site_target$air_temperature)
+      fit <- lm(temperature ~ air_temperature +
+                  eastward_wind +
+                  surface_downwelling_shortwave_flux_in_air +
+                  I(air_temperature^2) + 
+                  air_temperature_lag + 
+                  shortwave_lag, data=site_target)
+      
+      fit_summary <- summary(fit)
+      coeffs <- round(fit$coefficients, 2)
+      params_se <- fit_summary$coefficients[,2]
+      param_df <- data.frame(beta1 = rnorm(31, coeffs[1], params_se[1]),
+                              beta2 = rnorm(31, coeffs[2], params_se[2]),
+                              beta3 = rnorm(31, coeffs[3], params_se[3]),
+                              beta4 = rnorm(31, coeffs[4], params_se[4]),
+                              beta5 = rnorm(31, coeffs[5], params_se[5]),
+                              beta6 = rnorm(31, coeffs[6], params_se[6]),
+                              beta7 = rnorm(31, coeffs[7], params_se[7]))
+      
+      mod <- predict(fit, data = site_target)
+      # mod <- c(NA, mod)
+      residuals <- mod - site_target$temperature
+      sigma <- sd(residuals, na.rm = TRUE)
+      
+      
+      # use linear regression to forecast water temperature for each ensemble member
+      # You will need to modify this line of code if you add additional weather variables or change the form of the model
+      # The model here needs to match the model used in the lm function above (or what model you used in the fit)
+      # forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+      
+      # forecasted_temperature <- predict(fit, newdata = noaa_future_site)
+      forecasted_temperature <- param_df$beta1 + noaa_future_site$air_temperature * param_df$beta2 +
+                              noaa_future_site$eastward_wind * param_df$beta3 + 
+                              noaa_future_site$surface_downwelling_shortwave_flux_in_air * param_df$beta4 + 
+                              (noaa_future_site$air_temperature^2) * param_df$beta5 + 
+                              noaa_future_site$air_temperature_lag * param_df$beta6 +
+                              noaa_future_site$shortwave_lag * param_df$beta7 +
+                              rnorm(n = 31, mean = 0, sd = sigma)
+      # put all the relevant information into a tibble that we can bind together
+      # forecasting result for single site
+      curr_site_df <- tibble(datetime = noaa_future_site$datetime,
+                             site_id = curr_site,
+                             parameter = noaa_future_site$parameter,
+                             prediction = forecasted_temperature,
+                             variable = "temperature") #Change this if you are forecasting a different variable
+      
+      forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
+      message(curr_site, 'forecast run')
+      
+    }
+    
+    
+    #--------------------------#
+    
+    
+    #---- Covert to EFI standard ----
+    
+    # Make forecast fit the EFI standards
+    forecast_df_EFI <- forecast_df %>%
+      filter(datetime > forecast_date) %>%
+      mutate(model_id = my_model_id,
+             reference_datetime = forecast_date,
+             family = 'ensemble',
+             duration = 'P1D',
+             parameter = as.character(parameter),
+             project_id = 'neon4cast') %>%
+      select(datetime, reference_datetime, duration, site_id, family, parameter, variable, prediction, model_id, project_id)
+    #---------------------------#
+    
+    
+    
+    
+    # ----- Submit forecast -----
+    # Write the forecast to file
+    theme <- 'aquatics'
+    date <- forecast_df_EFI$reference_datetime[1]
+    forecast_name <- paste0(forecast_df_EFI$model_id[1], ".csv")
+    forecast_file <- paste(theme, date, forecast_name, sep = '-')
+    
+    write_csv(forecast_df_EFI, forecast_file)
+    
+    neon4cast::forecast_output_validator(forecast_file)
+    
+    
+    neon4cast::submit(forecast_file =  forecast_file, ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
+    
+    #--------------------------#
+    Sys.setlocale("LC_TIME", "English")
+    forecast_df_EFI |> 
+      ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+      geom_line() +
+      facet_wrap(~site_id) +
+      labs(title = paste0('Forecast generated for ', forecast_df_EFI$variable[1], ' on ', forecast_df_EFI$reference_datetime[1]))
+    
+    plot_file_name <- paste0("Submit_forecast/", forecast_df_EFI$variable[1], '-', forecast_df_EFI$reference_datetime[1], ".png")
+    ggsave(plot_file_name, width = 12, height = 8)
+    
+    # plot needs to be submitted to Canvas
