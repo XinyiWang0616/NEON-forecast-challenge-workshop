@@ -1,0 +1,443 @@
+---
+title: "reforecast_analysis"
+author: Xinyi Wang
+course: Ecological forecasting
+format:   
+  html:
+    embed-resources: true
+---
+The code is available here: 
+## Step 1: Obtain data and preprocess
+
+This project aims to apply linear model to reforecast water temperature.The data are from NEON and NOAA forecasting. Therefore, the target is "water temperature", and the predictors include air temperature, wind, and shortwave.
+
+### 1.1 filter the targets
+```{r}
+library(tidyverse)
+library(lubridate)
+library(duckdbfs)
+library(scoringRules)
+```
+
+```{r}
+# read in the targets data
+targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+
+# keep only aquatic sites
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-ci/refs/heads/main/neon4cast_field_site_metadata.csv") |>
+  dplyr::filter(aquatics == 1)
+
+# select only lake sites for this analysis
+#focal_sites <- aquatic_sites |> 
+ # filter(field_site_subtype == 'Lake') |> 
+#  pull(field_site_id)
+
+focal_sites <- 'BARC'
+
+# filter the targets, the model here is developed for water temperature
+targets <- targets %>%
+  filter(site_id %in% focal_sites,
+         variable %in% c('temperature', 'oxygen'))
+
+```
+
+### 1.2 read and process historical weather drivers
+```{r}
+# meteo predictors used in the model
+met_variables <- c("air_temperature", 
+                   "eastward_wind",
+                   "surface_downwelling_shortwave_flux_in_air")
+
+# download historical NOAA driver data, these data are used as predictors during model training
+weather_past_s3 <- neon4cast::noaa_stage3()
+
+weather_past <- weather_past_s3  |> 
+  dplyr::filter(site_id %in% focal_sites,
+                datetime >= ymd('2017-01-01'),
+                variable %in% met_variables) |> 
+  dplyr::collect()
+
+# aggregate historical weather to daily mean values
+weather_past_daily <- weather_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  # mean daily forecasts at each site per ensemble
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+
+```
+
+
+### 1.3 combine obs and historical drivers
+```{r}
+targets_lm <- targets |> 
+  pivot_wider(names_from = "variable", values_from = "observation") |> 
+  left_join(weather_past_daily, by = c("datetime", "site_id"))
+
+```
+
+## Step 2: Fit model and generate forecast
+
+### 2.1 define reforecast dates
+Define the reference dates for reforecasting. Each date represents one historical forecast initialization date.
+```{r}
+reforecast_dates <- seq(from = as.Date("2022-01-01 00:00:00"), to = as.Date("2022-12-31 00:00:00"),by = "day")
+
+# create a list to store reforecast results from all reference dates
+all_reforecasts <- list()
+k <- 1
+```
+
+### 2.2 fit linear model
+In this step, for each reforecast date, we need to:
+  read future weather drivers;
+  prepare ensemble members;
+  build training datasets using only data available before the date
+  build future driver datasets
+  fit a linear model;
+  generate and combine forecasts;
+
+Uncertainty: Process uncertainty, Drivers uncertainty, Parameter uncertainty, and Initial condition uncertainty are included in the forecasting.
+
+```{r}
+my_model_id <- 'example_ID'
+for (ii in seq_along(reforecast_dates)) {
+  forecast_date <- reforecast_dates[ii]
+  noaa_date <- forecast_date - 1
+  
+  message("Reforecast for ", as.character(forecast_date))
+  weather_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+  weather_future <- weather_future_s3 |> 
+    dplyr::filter(datetime >= forecast_date,
+                  site_id %in% focal_sites,
+                  variable %in% met_variables) |> 
+    collect()
+  
+  weather_future_daily <- weather_future |> 
+    mutate(datetime = as_date(datetime)) |> 
+    group_by(datetime, site_id, parameter, variable) |> 
+    summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+    mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+    pivot_wider(names_from = variable, values_from = prediction) |> 
+    select(any_of(c("datetime", "site_id", met_variables, "parameter")))
+  
+  forecast_df <- NULL
+  n_drivers <- n_distinct(weather_future_daily$parameter)
+  n_rep <- 10
+  n_members <- n_drivers * n_rep
+  
+  for (i in 1:length(focal_sites)) {
+    
+    curr_site <- focal_sites[i]
+    site_target <- targets_lm |>
+      filter(site_id == curr_site,
+             datetime < forecast_date) |>
+      arrange(datetime) |>
+      mutate(
+        temp_lag = lag(temperature, 1),
+        air_temp_7days = as.numeric(stats::filter(air_temperature, rep(1/7, 7), sides = 1))
+      ) |>
+      drop_na(temperature, temp_lag, air_temperature, eastward_wind, surface_downwelling_shortwave_flux_in_air, air_temp_7days)
+    
+    noaa_future_site <- weather_future_daily |> 
+      filter(site_id == curr_site) |>
+      arrange(parameter, datetime) |>
+      group_by(parameter) |>
+      ungroup()
+    
+    last_hist <- site_target |>
+      arrange(datetime) |>
+      slice_tail(n = 1)
+    
+    noaa_future_site <- noaa_future_site |>
+      group_by(parameter) |>
+      ungroup()
+    
+    fit <- lm(temperature ~ temp_lag + air_temperature + eastward_wind + surface_downwelling_shortwave_flux_in_air + I(air_temperature^2) + air_temp_7days, data = site_target)
+    
+    fit_summary <- summary(fit)
+    coeffs <- fit$coefficients
+    params_se <- fit_summary$coefficients[, 2]
+    
+    param_df <- tibble(
+      member_id = 1:n_members,
+      driver_parameter = rep(sort(unique(noaa_future_site$parameter)), each = n_rep),
+      rep_id = rep(1:n_rep, times = n_drivers),
+      beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+      beta2 = rnorm(n_members, coeffs[2], params_se[2]),
+      beta3 = rnorm(n_members, coeffs[3], params_se[3]),
+      beta4 = rnorm(n_members, coeffs[4], params_se[4]),
+      beta5 = rnorm(n_members, coeffs[5], params_se[5]),
+      beta6 = rnorm(n_members, coeffs[6], params_se[6]),
+      beta7 = rnorm(n_members, coeffs[7], params_se[7]))
+    
+    mod <- predict(fit, newdata = site_target)
+    residuals <- mod - site_target$temperature
+    sigma <- sd(residuals, na.rm = TRUE)
+    
+    last_temp <- site_target |>
+      arrange(datetime) |>
+      slice_tail(n = 1) |>
+      pull(temperature)
+    
+    init_df <- tibble(
+      member_id = 1:n_members,
+      init_temp = rnorm(n_members, mean = last_temp, sd = sigma))
+    
+    forecast_list <- list()
+    
+    for (j in 1:n_members) {
+      current_driver <- param_df$driver_parameter[j]
+      
+      future_j <- noaa_future_site |>
+        filter(parameter == current_driver) |>
+        arrange(datetime)
+      
+      pred_j <- numeric(nrow(future_j))
+      temp_prev <- init_df$init_temp[j]
+      
+      air_temp_hist <- site_target |>
+        arrange(datetime) |>
+        slice_tail(n = 6) |>
+        pull(air_temperature)
+      
+      for (t in 1:nrow(future_j)) {
+        current_air_temp <- future_j$air_temperature[t]
+        air_temp_window <- c(air_temp_hist, current_air_temp)
+        air_temp_7days <- mean(air_temp_window, na.rm = TRUE)
+    
+        pred <- param_df$beta1[j] +
+          param_df$beta2[j] * temp_prev +
+          param_df$beta3[j] * future_j$air_temperature[t] +
+          param_df$beta4[j] * future_j$eastward_wind[t] +
+          param_df$beta5[j] * future_j$surface_downwelling_shortwave_flux_in_air[t] +
+          param_df$beta6[j] * (future_j$air_temperature[t])^2 +
+          param_df$beta7[j] * air_temp_7days
+        
+        pred_j[t] <- pred + rnorm(1, mean = 0, sd = sigma)
+        temp_prev <- pred_j[t]
+        air_temp_hist <- tail(air_temp_window, 6)}
+      
+      forecast_list[[j]] <- tibble(
+        datetime = future_j$datetime,
+        site_id = curr_site,
+        parameter = as.character(j),
+        prediction = pred_j,
+        variable = "temperature"
+      )
+    }
+    
+    curr_site_df <- bind_rows(forecast_list)
+    
+    if (nrow(curr_site_df) > 0) {
+      forecast_df <- bind_rows(forecast_df, curr_site_df)
+      message(curr_site, " reforecast run at ", forecast_date)
+    }
+  }
+  
+  if (!is.null(forecast_df) && nrow(forecast_df) > 0) {
+    forecast_df <- forecast_df |>
+      mutate(
+        reference_datetime = forecast_date,
+        model_id = my_model_id,
+        family = "ensemble",
+        duration = "P1D",
+        project_id = "neon4cast"
+      )
+    
+    all_reforecasts[[k]] <- forecast_df
+    k <- k + 1
+  }
+}
+```
+
+
+## Step 3. Organize forecasting results and save
+combine all reforecast dates
+```{r}
+reforecast_df <- bind_rows(all_reforecasts) |>
+  select(datetime, reference_datetime, duration, site_id,
+         family, parameter, variable, prediction, model_id, project_id)
+```
+
+save outputs
+```{r}
+reforecast_df_EFI <- reforecast_df %>%
+  filter(datetime > forecast_date) %>%
+  mutate(model_id = my_model_id,
+         reference_datetime = forecast_date,
+         family = 'ensemble',
+         duration = 'P1D',
+         parameter = as.character(parameter),
+         project_id = 'neon4cast') %>%
+  select(datetime, reference_datetime, duration, site_id, family, parameter, variable, prediction, model_id, project_id)
+
+# Write the forecast to file
+theme <- 'aquatics'
+date <- reforecast_df_EFI$reference_datetime[1]
+forecast_name <- paste0(reforecast_df_EFI$model_id[1], ".csv")
+forecast_file <- paste(theme, date, forecast_name, sep = '-')
+
+write_csv(reforecast_df_EFI, forecast_file)
+```
+
+
+### Generate plots
+```{r}
+reforecast_df_EFI |>
+  ggplot(aes(x = datetime, y = prediction, group = interaction(reference_datetime, parameter))) +
+  geom_line(alpha = 0.3) +
+  facet_wrap(~site_id) +
+  labs(title = "Reforecast results")
+
+plot_file_name <- paste0("reforecast_figures/", reforecast_df_EFI$variable[1], '-', reforecast_df_EFI$reference_datetime[1], ".png")
+ggsave(plot_file_name, width = 12, height = 8)
+```
+
+
+```{r}
+#| echo: true
+#| output: true
+model_summary <- reforecast_df_EFI %>%
+  group_by(site_id, datetime) %>%
+  summarize(
+    mean = mean(prediction, na.rm = TRUE),
+    median = median(prediction, na.rm = TRUE),
+    q02.5 = quantile(prediction, 0.025, na.rm = TRUE),
+    q10 = quantile(prediction, 0.10, na.rm = TRUE),
+    q90 = quantile(prediction, 0.90, na.rm = TRUE),
+    q97.5 = quantile(prediction, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+model_summary %>%
+  filter(site_id == "BARC") %>%
+  ggplot(aes(x = datetime)) +
+  geom_ribbon(aes(ymin = q02.5, ymax = q97.5), fill = "lightblue") +
+  geom_line(aes(y = mean), color = "blue", linewidth = 0.6) +
+  labs(
+    title = "Reforecast for BARC",
+    x = "datetime",
+    y = "predicted water temperature"
+  )
+```
+
+### Evaluation
+
+```{r}
+all_results <- open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature", 
+                            s3_endpoint = "sdsc.osn.xsede.org", 
+                            anonymous = TRUE)
+
+baseline_forecasts <- all_results |> 
+  filter(datetime >= "2023-01-01", datetime <= "2023-02-03") |>
+  filter(site_id == "BARC",
+         model_id %in% c("climatology", "persistenceRW")) |> 
+  collect() 
+```
+
+
+```{r}
+# climatology
+
+CLI_forecast <- baseline_forecasts |> 
+  filter(model_id == "climatology") |> 
+  pivot_wider(names_from = parameter, values_from = prediction) |> 
+  mutate(lower_2.5 = mu - 1.96*sigma,
+         upper_97.5 = mu + 1.96*sigma) |> 
+  ggplot(aes(x = datetime)) +
+  geom_ribbon(aes(ymin = lower_2.5, ymax = upper_97.5), fill = "lightblue") +
+  geom_line(aes(y = mu)) + 
+  labs(title = "climatology forecast")
+CLI_forecast
+
+PER_forecast <- baseline_forecasts |> 
+  filter(model_id == "persistenceRW") |> 
+  ggplot(aes(x = datetime, y = prediction, group = parameter)) +
+  geom_line() +
+  labs(title = "persistenceRW forecast")
+PER_forecast
+```
+
+
+calculate crps scores for the two baseline models
+```{r}
+url <- "https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz"
+targets <- read_csv(url)
+
+multi_forecast_ensemble_PER <- baseline_forecasts |> 
+  filter(model_id == "persistenceRW") |> 
+  left_join(targets, by = c("datetime", "site_id", "variable")) |> 
+  select(model_id, reference_datetime, datetime, prediction, observation, parameter)
+
+
+multi_forecast_parametric_CLI <- baseline_forecasts |>
+  filter(model_id == "climatology") |>
+  left_join(targets, by = c("datetime", "site_id", "variable")) |>
+  drop_na(observation) |>
+  select(model_id, reference_datetime, datetime, observation, parameter, prediction) |>
+  pivot_wider(names_from = parameter, values_from = prediction) |>
+  mutate(reference_datetime = as.Date(reference_datetime), datetime = as.Date(datetime), mu = as.numeric(mu), sigma = as.numeric(sigma), observation = as.numeric(observation), horizon = as.numeric(datetime - reference_datetime), crps = scoringRules::crps_norm(y = observation, location = mu, scale = sigma))
+
+normal_crps_CLI <- multi_forecast_parametric_CLI |>
+  group_by(datetime, reference_datetime, model_id) |>
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma), .groups = "drop")
+
+crps_tidy_ensemble <- function(prediction, observation) {
+  obs <- observation[1] #all the observations are the same for each row, but we only need one
+  crps_sample(obs, prediction)
+}
+
+#Use the function
+ensemble_crps_PER <- multi_forecast_ensemble_PER |> 
+  group_by(datetime, model_id, reference_datetime) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) |>
+  mutate(horizon = as.numeric(datetime - reference_datetime))
+
+```
+
+calculate crps score for reforecast
+```{r}
+multi_forecast_ensemble <- reforecast_df_EFI |> 
+  filter(model_id == "example_ID") |> 
+  left_join(targets, by = c("datetime", "site_id", "variable")) |> 
+  drop_na(observation) |>
+  select(model_id, datetime, prediction, observation, parameter, reference_datetime)
+
+
+crps_tidy_ensemble <- function(prediction, observation) {
+  obs <- observation[1] #all the observations are the same for each row, but we only need one
+  crps_sample(y=obs, dat=prediction)
+}
+
+ensemble_crps <- multi_forecast_ensemble |> 
+  group_by(datetime, model_id, reference_datetime) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation), .groups = "drop") |>
+  mutate(horizon = as.numeric(datetime - reference_datetime))
+
+#Plot the histogram of the scores of reforecast and baseline forecasting
+crps_all <- bind_rows(ensemble_crps, normal_crps_CLI, ensemble_crps_PER)
+crps_all <- crps_all %>%
+  mutate(datetime = as.Date(datetime), reference_datetime = as.Date(reference_datetime), horizon = as.numeric(datetime - reference_datetime))
+
+crps_all |>
+  group_by(model_id, horizon) |>
+  summarize(mean_crps = mean(crps, na.rm=TRUE), .groups="drop") |>
+  ggplot(aes(x = horizon, y = mean_crps, color = model_id)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(title = "Model evaluation", x = "forecast horizon (days)", y = "mean crps", color = "Model") +
+  theme_minimal()
+```
+
+### Model performance description:
+Scores are shown by forecast horizon in the figure above. "Example_ID" is the reforecast model built above. For 1-10 days, the example_ID model achieves the lowest score, showing it has good performance compared to the two baseline models. For 10-30 days, the example_ID model continues to outperform both baselines. However, the score of persistenceRW increase significantly, showing a degradation in performance as horizon increases, while climatology remains relatively stable. When the forecast horizon is greater than 30 days, the performance of example_ID model declines significantly, and climatology becomes the best performing model. Overall, the example_ID model demonstrates relatively strong predictive skill at short forecast horizon, consistently outperforming both climatology and persistenceRW. However, its performance would decline at longer horizon. The score of climatology model remains essentially unchanged throughout the entire forecast horizon, showing relatively stable performance. The persistenceRW model performs well only at very short horizons but rapidly loses skill over time.
+
+
+
+
+
+
+
+
